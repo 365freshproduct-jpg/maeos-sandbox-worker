@@ -1,0 +1,167 @@
+name: MAEOS Isolated Sandbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Public repository in owner/name form
+        required: true
+        type: string
+      ref:
+        description: Public branch/tag/SHA to test
+        required: true
+        type: string
+      profile:
+        description: Verification profile
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - node
+          - python
+          - static
+      timeout_minutes:
+        description: Job timeout, 1-20
+        required: true
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maeos-sandbox
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ""
+      GITHUB_TOKEN: ""
+      CI: "1"
+      NODE_ENV: test
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - name: Validate public target
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO='${{ inputs.repository }}'
+          REF='${{ inputs.ref }}'
+          PROFILE='${{ inputs.profile }}'
+          TIMEOUT='${{ inputs.timeout_minutes }}'
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "invalid repository"; exit 2; }
+          [[ "$REF" =~ ^[A-Za-z0-9_./:-]+$ ]] || { echo "invalid ref"; exit 2; }
+          [[ "$PROFILE" =~ ^(auto|node|python|static)$ ]] || { echo "invalid profile"; exit 2; }
+          [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || { echo "invalid timeout"; exit 2; }
+          [ "$TIMEOUT" -ge 1 ] && [ "$TIMEOUT" -le 20 ] || { echo "timeout out of range"; exit 2; }
+
+      - name: Clone public repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf target
+          git -c credential.helper= clone --filter=blob:none --no-tags "https://github.com/${{ inputs.repository }}.git" target
+          cd target
+          git checkout --detach "${{ inputs.ref }}"
+          echo "TARGET_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Static safety inventory
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          echo "sha=$TARGET_SHA"
+          echo "files=$(git ls-files | wc -l)"
+          echo "top-level:"
+          find . -maxdepth 1 -mindepth 1 -printf '%f\n' | sort | head -100
+          git diff --check HEAD^ HEAD 2>/dev/null || true
+
+      - name: Detect profile
+        id: detect
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          PROFILE='${{ inputs.profile }}'
+          if [ "$PROFILE" = auto ]; then
+            if [ -f package.json ]; then PROFILE=node
+            elif [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; then PROFILE=python
+            else PROFILE=static
+            fi
+          fi
+          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
+          echo "Detected profile: $PROFILE"
+
+      - name: Node verification
+        if: steps.detect.outputs.profile == 'node'
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm --version
+            pnpm install --frozen-lockfile --ignore-scripts
+            for script in typecheck lint test build; do
+              if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts['$script']?0:1)"; then
+                pnpm run "$script"
+              fi
+            done
+          elif [ -f package-lock.json ]; then
+            npm ci --ignore-scripts
+            for script in typecheck lint test build; do
+              if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts['$script']?0:1)"; then
+                npm run "$script"
+              fi
+            done
+          else
+            npm install --ignore-scripts
+            for script in typecheck lint test build; do
+              if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts['$script']?0:1)"; then
+                npm run "$script"
+              fi
+            done
+          fi
+
+      - name: Python verification
+        if: steps.detect.outputs.profile == 'python'
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install .; fi
+          if [ -d tests ] || find . -maxdepth 2 -type f -name 'test_*.py' | grep -q .; then
+            python -m pytest -q
+          else
+            python -m compileall -q .
+          fi
+
+      - name: Static-only verification
+        if: steps.detect.outputs.profile == 'static'
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          git diff --check
+          if find . -type f -name '*.sh' -not -path './.git/*' | grep -q .; then
+            find . -type f -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r -n1 bash -n
+          fi
+          echo "Static verification complete."
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf target
