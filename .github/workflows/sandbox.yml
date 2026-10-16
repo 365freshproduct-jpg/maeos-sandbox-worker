@@ -65,9 +65,12 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf target
-          git -c credential.helper= clone --filter=blob:none --no-tags "https://github.com/${{ inputs.repository }}.git" target
+          mkdir target
           cd target
-          git checkout --detach "${{ inputs.ref }}"
+          git init -q
+          git remote add origin "https://github.com/${{ inputs.repository }}.git"
+          git -c credential.helper= fetch --depth=1 --no-tags origin "${{ inputs.ref }}"
+          git checkout -q --detach FETCH_HEAD
           echo "TARGET_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Static safety inventory
